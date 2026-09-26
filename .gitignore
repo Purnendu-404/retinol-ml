@@ -1,0 +1,21 @@
+# Python virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# PyTorch model - keep locally, don't push
+model/Retinol_BEST.pt
+
+# Development / conversion scripts
+compare_models.py
+convert_to_onnx.py
+memory_test.py
+onnx_memory_test.py
+
+# Debug outputs
+debug_retinol/
+
+# Local test image
+test_image.jpg

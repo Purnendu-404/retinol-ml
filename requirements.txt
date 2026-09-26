@@ -1,9 +1,6 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-Flask==3.0.3
-Pillow==10.4.0
-numpy==1.26.4
-opencv-python-headless==4.10.0.84
-torch==2.9.0+cpu
-torchvision==0.24.0+cpu
-gunicorn==22.0.0
- 
+Flask
+Pillow
+numpy
+opencv-python
+torch
+torchvision
