@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 import base64
+import threading
 import onnxruntime as ort
 
 from pathlib import Path
@@ -374,52 +375,143 @@ def extract_edges(img):
 
 
 # ============================================================
-# LOAD ONNX MODEL
+# MODEL STATE — loaded in a background thread, not at import
+# ============================================================
+#
+# State machine:
+#   "loading" -> model is being loaded/warmed up, not usable yet
+#   "ready"   -> _session/_input_name/_output_name are safe to use
+#   "failed"  -> load_model() raised; _error holds the message
+#
+# start_loading() is called once from app.py, right after the
+# Flask app object is created. This means Gunicorn can bind the
+# port and answer /health immediately, while the model loads
+# in parallel on a daemon thread.
 # ============================================================
 
-def load_model():
+_session = None
+_input_name = None
+_output_name = None
 
-    print(
-        f"Loading ONNX model from: {MODEL_PATH}"
+_state = "loading"
+_error = None
+_lock = threading.Lock()
+
+
+def _load_model_sync():
+    global _session, _input_name, _output_name, _state, _error
+
+    try:
+        print(
+            f"Loading ONNX model from: {MODEL_PATH}"
+        )
+
+        session = ort.InferenceSession(
+            str(MODEL_PATH),
+            providers=[
+                "CPUExecutionProvider"
+            ]
+        )
+
+        input_name = (
+            session.get_inputs()[0].name
+        )
+
+        output_name = (
+            session.get_outputs()[0].name
+        )
+
+        print(
+            "ONNX model loaded. Running warmup inference..."
+        )
+
+        # ----------------------------------------------------
+        # Warmup pass
+        #
+        # ONNX Runtime can defer graph optimizations / memory
+        # arena allocation until the first real run() call, so
+        # without this, the FIRST real user request would pay
+        # that cost on top of everything else. Running one
+        # dummy inference now absorbs it during startup.
+        # ----------------------------------------------------
+
+        dummy_input = np.zeros(
+            (1, 4, IMAGE_SIZE, IMAGE_SIZE),
+            dtype=np.float32
+        )
+
+        session.run(
+            [output_name],
+            {input_name: dummy_input}
+        )
+
+        with _lock:
+            _session = session
+            _input_name = input_name
+            _output_name = output_name
+            _state = "ready"
+
+        print(
+            "ONNX model loaded and warmed up successfully."
+        )
+
+        print(
+            f"Input: {input_name}"
+        )
+
+        print(
+            f"Output: {output_name}"
+        )
+
+        print(
+            f"Provider: {session.get_providers()}"
+        )
+
+    except Exception as e:
+
+        with _lock:
+            _state = "failed"
+            _error = str(e)
+
+        print(
+            f"Model load failed: {e}"
+        )
+
+
+def start_loading():
+    """
+    Call once, from app.py, immediately after the Flask app is
+    created. Loading runs on a daemon thread so it never blocks
+    Gunicorn from binding the port or serving /health.
+    """
+
+    thread = threading.Thread(
+        target=_load_model_sync,
+        daemon=True
     )
 
-    session = ort.InferenceSession(
-        str(MODEL_PATH),
-        providers=[
-            "CPUExecutionProvider"
-        ]
-    )
-
-    input_name = (
-        session.get_inputs()[0].name
-    )
-
-    output_name = (
-        session.get_outputs()[0].name
-    )
-
-    print(
-        "ONNX model loaded successfully."
-    )
-
-    print(
-        f"Input: {input_name}"
-    )
-
-    print(
-        f"Output: {output_name}"
-    )
-
-    return (
-        session,
-        input_name,
-        output_name
-    )
+    thread.start()
 
 
-session, INPUT_NAME, OUTPUT_NAME = (
-    load_model()
-)
+def get_state():
+    """
+    Returns (state, error) where state is one of
+    "loading" / "ready" / "failed".
+    """
+
+    with _lock:
+        return _state, _error
+
+
+def get_session():
+    """
+    Returns (session, input_name, output_name).
+    Only call this after get_state() confirms "ready" —
+    callers in app.py are responsible for that check.
+    """
+
+    with _lock:
+        return _session, _input_name, _output_name
 
 
 # ============================================================
@@ -735,15 +827,24 @@ def softmax(logits):
 # ============================================================
 
 def run_model(tensor):
-
     """
     Run one forward pass through ONNX Runtime.
+
+    Reads the session via get_session() rather than a module
+    global, since the session is now populated asynchronously
+    by the background loader thread. Callers (predict(), and
+    ultimately app.py) are responsible for checking get_state()
+    == "ready" before this is ever called — this function does
+    not re-check state itself, to avoid a second lock/branch on
+    every single inference call in the hot path.
     """
 
+    session, input_name, output_name = get_session()
+
     logits = session.run(
-        [OUTPUT_NAME],
+        [output_name],
         {
-            INPUT_NAME: tensor
+            input_name: tensor
         }
     )[0]
 
@@ -900,23 +1001,32 @@ if __name__ == "__main__":
 
     print()
     print("=" * 60)
-    print("ONNX INFERENCE MODULE READY")
+    print("ONNX INFERENCE MODULE — MANUAL TEST")
     print("=" * 60)
 
-    print(
-        f"Model: {MODEL_PATH}"
-    )
+    start_loading()
 
-    print(
-        f"Input: 4 x {IMAGE_SIZE} x {IMAGE_SIZE}"
-    )
+    # Block here only for the __main__ test script — app.py
+    # never does this, it just calls start_loading() and moves on.
 
-    print(
-        f"Classes: {CLASS_NAMES}"
-    )
+    import time
 
-    print(
-        f"Provider: {session.get_providers()}"
-    )
+    while True:
+        state, error = get_state()
 
+        if state == "ready":
+            break
+
+        if state == "failed":
+            print(f"Load failed: {error}")
+            raise SystemExit(1)
+
+        time.sleep(0.5)
+
+    session, input_name, output_name = get_session()
+
+    print(f"Model: {MODEL_PATH}")
+    print(f"Input: 4 x {IMAGE_SIZE} x {IMAGE_SIZE}")
+    print(f"Classes: {CLASS_NAMES}")
+    print(f"Provider: {session.get_providers()}")
     print("=" * 60)
