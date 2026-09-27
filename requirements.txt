@@ -1,5 +1,5 @@
 Flask
-Pillow
+Flask-Cors
 numpy
 opencv-python-headless
 onnxruntime

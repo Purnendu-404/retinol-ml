@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from PIL import Image
 from io import BytesIO
 from urllib.request import urlopen
@@ -7,6 +8,15 @@ from urllib.error import URLError, HTTPError
 import inference_onnx
 
 app = Flask(__name__)
+
+CORS(
+    app,
+    resources={
+        r"/health": {
+            "origins": "https://retinol.onrender.com"
+        }
+    }
+)
 
 inference_onnx.start_loading()
 
