@@ -402,38 +402,22 @@ def _load_model_sync():
     global _session, _input_name, _output_name, _state, _error
 
     try:
-        print(
-            f"Loading ONNX model from: {MODEL_PATH}"
-        )
+        print("========== MODEL LOADING START ==========", flush=True)
+        print(f"Loading ONNX model from: {MODEL_PATH}", flush=True)
+
+        print("Creating ONNX Runtime session...", flush=True)
 
         session = ort.InferenceSession(
             str(MODEL_PATH),
-            providers=[
-                "CPUExecutionProvider"
-            ]
+            providers=["CPUExecutionProvider"]
         )
 
-        input_name = (
-            session.get_inputs()[0].name
-        )
+        print("ONNX Runtime session CREATED.", flush=True)
 
-        output_name = (
-            session.get_outputs()[0].name
-        )
+        input_name = session.get_inputs()[0].name
+        output_name = session.get_outputs()[0].name
 
-        print(
-            "ONNX model loaded. Running warmup inference..."
-        )
-
-        # ----------------------------------------------------
-        # Warmup pass
-        #
-        # ONNX Runtime can defer graph optimizations / memory
-        # arena allocation until the first real run() call, so
-        # without this, the FIRST real user request would pay
-        # that cost on top of everything else. Running one
-        # dummy inference now absorbs it during startup.
-        # ----------------------------------------------------
+        print("Starting warmup inference...", flush=True)
 
         dummy_input = np.zeros(
             (1, 4, IMAGE_SIZE, IMAGE_SIZE),
@@ -445,38 +429,22 @@ def _load_model_sync():
             {input_name: dummy_input}
         )
 
+        print("WARMUP COMPLETE.", flush=True)
+
         with _lock:
             _session = session
             _input_name = input_name
             _output_name = output_name
             _state = "ready"
 
-        print(
-            "ONNX model loaded and warmed up successfully."
-        )
-
-        print(
-            f"Input: {input_name}"
-        )
-
-        print(
-            f"Output: {output_name}"
-        )
-
-        print(
-            f"Provider: {session.get_providers()}"
-        )
+        print("========== MODEL READY ==========", flush=True)
 
     except Exception as e:
-
         with _lock:
             _state = "failed"
             _error = str(e)
 
-        print(
-            f"Model load failed: {e}"
-        )
-
+        print(f"MODEL LOAD FAILED: {e}", flush=True)
 
 def start_loading():
     """
