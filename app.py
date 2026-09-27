@@ -18,7 +18,13 @@ CORS(
     }
 )
 
-inference_onnx.start_loading()
+
+@app.before_request
+def ensure_model_loading():
+    state, _ = inference_onnx.get_state()
+
+    if state == "loading":
+        inference_onnx.start_loading()
 
 
 @app.get("/health")
@@ -26,7 +32,9 @@ def health():
     state, error = inference_onnx.get_state()
 
     if state == "ready":
-        return jsonify({"status": "ready"}), 200
+        return jsonify({
+            "status": "ready"
+        }), 200
 
     if state == "failed":
         return jsonify({
@@ -34,7 +42,9 @@ def health():
             "error": error
         }), 503
 
-    return jsonify({"status": "loading"}), 503
+    return jsonify({
+        "status": "loading"
+    }), 503
 
 
 @app.post("/predict-url")
@@ -57,21 +67,37 @@ def prediction_from_url():
     data = request.get_json()
 
     if not data or "image_url" not in data:
-        return jsonify({"error": "image_url is required"}), 400
+        return jsonify({
+            "error": "image_url is required"
+        }), 400
 
     try:
-        with urlopen(data["image_url"], timeout=30) as response:
+        with urlopen(
+            data["image_url"],
+            timeout=30
+        ) as response:
             image_data = response.read()
-    except (URLError, HTTPError, TimeoutError) as e:
+
+    except (
+        URLError,
+        HTTPError,
+        TimeoutError
+    ) as e:
+
         return jsonify({
             "status": "image_fetch_failed",
             "error": str(e)
         }), 502
 
     try:
-        image = Image.open(BytesIO(image_data))
+        image = Image.open(
+            BytesIO(image_data)
+        )
+
         image.load()
+
     except Exception as e:
+
         return jsonify({
             "status": "invalid_image",
             "error": str(e)
@@ -79,7 +105,9 @@ def prediction_from_url():
 
     try:
         result = inference_onnx.predict(image)
+
     except Exception as e:
+
         return jsonify({
             "status": "inference_error",
             "error": str(e)
@@ -89,4 +117,8 @@ def prediction_from_url():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, debug=False)
+    app.run(
+        host="0.0.0.0",
+        port=5001,
+        debug=False
+    )
