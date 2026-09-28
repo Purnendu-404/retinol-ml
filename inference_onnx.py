@@ -2,6 +2,7 @@ import numpy as np
 import cv2
 import base64
 import threading
+import time
 import onnxruntime as ort
 
 from pathlib import Path
@@ -929,16 +930,38 @@ def run_model(tensor):
 
 def predict(image):
 
+    total_start = time.perf_counter()
+
+    # --------------------------------------------------------
+    # Preprocessing
+    # --------------------------------------------------------
+
+    preprocessing_start = time.perf_counter()
+
     tensor, roi_image, edges = (
         preprocess_image(image)
+    )
+
+    print(
+        f"[TIMING] preprocessing: "
+        f"{time.perf_counter() - preprocessing_start:.3f}s",
+        flush=True
     )
 
     # --------------------------------------------------------
     # Original
     # --------------------------------------------------------
 
+    inference_start = time.perf_counter()
+
     logits1 = run_model(
         tensor
+    )
+
+    print(
+        f"[TIMING] inference 1 (original): "
+        f"{time.perf_counter() - inference_start:.3f}s",
+        flush=True
     )
 
     probs1 = softmax(
@@ -954,8 +977,16 @@ def predict(image):
         axis=3
     ).copy()
 
+    inference_start = time.perf_counter()
+
     logits2 = run_model(
         tensor_h
+    )
+
+    print(
+        f"[TIMING] inference 2 (horizontal flip): "
+        f"{time.perf_counter() - inference_start:.3f}s",
+        flush=True
     )
 
     probs2 = softmax(
@@ -971,8 +1002,16 @@ def predict(image):
         axis=2
     ).copy()
 
+    inference_start = time.perf_counter()
+
     logits3 = run_model(
         tensor_v
+    )
+
+    print(
+        f"[TIMING] inference 3 (vertical flip): "
+        f"{time.perf_counter() - inference_start:.3f}s",
+        flush=True
     )
 
     probs3 = softmax(
@@ -989,8 +1028,16 @@ def predict(image):
         axes=(2, 3)
     ).copy()
 
+    inference_start = time.perf_counter()
+
     logits4 = run_model(
         tensor_r
+    )
+
+    print(
+        f"[TIMING] inference 4 (rotation): "
+        f"{time.perf_counter() - inference_start:.3f}s",
+        flush=True
     )
 
     probs4 = softmax(
@@ -1041,6 +1088,36 @@ def predict(image):
     }
 
     # --------------------------------------------------------
+    # Base64 encoding
+    # --------------------------------------------------------
+
+    base64_start = time.perf_counter()
+
+    processed_image_base64 = image_to_base64(
+        roi_image
+    )
+
+    edge_image_base64 = image_to_base64(
+        edges
+    )
+
+    print(
+        f"[TIMING] base64 encoding: "
+        f"{time.perf_counter() - base64_start:.3f}s",
+        flush=True
+    )
+
+    # --------------------------------------------------------
+    # Total predict()
+    # --------------------------------------------------------
+
+    print(
+        f"[TIMING] predict() TOTAL: "
+        f"{time.perf_counter() - total_start:.3f}s",
+        flush=True
+    )
+
+    # --------------------------------------------------------
     # Return API structure
     # --------------------------------------------------------
 
@@ -1055,13 +1132,9 @@ def predict(image):
 
         "probabilities": probabilities,
 
-        "processed_image": image_to_base64(
-            roi_image
-        ),
+        "processed_image": processed_image_base64,
 
-        "edge_image": image_to_base64(
-            edges
-        )
+        "edge_image": edge_image_base64
     }
 
 
@@ -1077,8 +1150,6 @@ if __name__ == "__main__":
     print("=" * 60)
 
     start_loading()
-
-    import time
 
     while True:
 
