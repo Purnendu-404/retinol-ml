@@ -1,3 +1,15 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from PIL import Image
+from io import BytesIO
+from urllib.request import urlopen
+from urllib.error import URLError, HTTPError
+import time
+
+import inference_onnx
+
+app = Flask(__name__)
+
 @app.post("/predict-url")
 def prediction_from_url():
 
