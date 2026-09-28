@@ -1,6 +1,7 @@
 import base64
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -650,6 +651,141 @@ def image_to_base64(image):
 
 
 # ============================================================
+# PARALLEL TTA
+# ============================================================
+
+def run_tta_parallel(tensor):
+    """
+    Run the four TTA variants concurrently.
+
+    TTA configuration:
+
+        Original       -> 40%
+        Horizontal     -> 25%
+        Vertical       -> 20%
+        Rotation       -> 15%
+
+    The transformations are performed on the already
+    preprocessed tensor, so preprocessing is NOT repeated.
+
+    Returns:
+        Weighted-average logits.
+    """
+
+    # --------------------------------------------------------
+    # Create TTA tensors
+    # --------------------------------------------------------
+
+    original = tensor
+
+    horizontal_flip = np.flip(
+        tensor,
+        axis=3
+    ).copy()
+
+    vertical_flip = np.flip(
+        tensor,
+        axis=2
+    ).copy()
+
+    rotation = np.rot90(
+        tensor,
+        k=1,
+        axes=(2, 3)
+    ).copy()
+
+    tta_tensors = [
+        original,
+        horizontal_flip,
+        vertical_flip,
+        rotation
+    ]
+
+    # --------------------------------------------------------
+    # TTA weights
+    # --------------------------------------------------------
+
+    weights = np.array(
+        [
+            0.40,
+            0.25,
+            0.20,
+            0.15
+        ],
+        dtype=np.float32
+    )
+
+    # --------------------------------------------------------
+    # Run four model passes concurrently
+    # --------------------------------------------------------
+
+    inference_start = time.perf_counter()
+
+    with ThreadPoolExecutor(
+        max_workers=4
+    ) as executor:
+
+        futures = [
+            executor.submit(
+                run_model,
+                tta_tensor
+            )
+            for tta_tensor in tta_tensors
+        ]
+
+        logits_list = [
+            future.result()
+            for future in futures
+        ]
+
+    inference_time = (
+        time.perf_counter()
+        - inference_start
+    )
+
+    print(
+        f"[TIMING] parallel TTA inference: "
+        f"{inference_time:.3f}s",
+        flush=True
+    )
+
+    # --------------------------------------------------------
+    # Convert each logits output to probabilities
+    # --------------------------------------------------------
+
+    probabilities = [
+        softmax(logits)[0]
+        for logits in logits_list
+    ]
+
+    # --------------------------------------------------------
+    # Weighted probability average
+    # --------------------------------------------------------
+
+    combined_probabilities = np.zeros(
+        NUM_CLASSES,
+        dtype=np.float32
+    )
+
+    for probability, weight in zip(
+        probabilities,
+        weights
+    ):
+        combined_probabilities += (
+            probability * weight
+        )
+
+    # --------------------------------------------------------
+    # Convert probabilities back to logits-like format
+    #
+    # The caller only needs probabilities, so return the
+    # combined probabilities directly.
+    # --------------------------------------------------------
+
+    return combined_probabilities
+
+
+# ============================================================
 # PREDICTION
 # ============================================================
 
@@ -674,38 +810,24 @@ def predict(image):
     )
 
     # --------------------------------------------------------
-    # SINGLE MODEL INFERENCE
-    #
-    # IMPORTANT:
-    # This is intentionally only ONE forward pass.
-    #
-    # Previous version:
-    #   original       40%
-    #   horizontal     25%
-    #   vertical       20%
-    #   rotation       15%
-    #
-    # This benchmark:
-    #   original       100%
+    # PARALLEL TTA INFERENCE
     # --------------------------------------------------------
 
     inference_start = time.perf_counter()
 
-    logits = run_model(
+    probs = run_tta_parallel(
         tensor
     )
 
     print(
-        f"[TIMING] inference (single pass): "
+        f"[TIMING] TTA total: "
         f"{time.perf_counter() - inference_start:.3f}s",
         flush=True
     )
 
-    probs = softmax(
-        logits
-    )
-
-    probs = probs[0]
+    # --------------------------------------------------------
+    # PREDICTION
+    # --------------------------------------------------------
 
     predicted_index = int(
         np.argmax(probs)
