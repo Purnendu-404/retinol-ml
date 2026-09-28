@@ -1,11 +1,10 @@
-import numpy as np
-import cv2
 import base64
 import threading
 import time
-import onnxruntime as ort
 
-from pathlib import Path
+import cv2
+import numpy as np
+import onnxruntime as ort
 from PIL import Image
 
 
@@ -13,13 +12,7 @@ from PIL import Image
 # CONFIG
 # ============================================================
 
-BASE_DIR = Path(__file__).resolve().parent
-
-MODEL_PATH = (
-    BASE_DIR
-    / "model"
-    / "Retinol_BEST.onnx"
-)
+MODEL_PATH = "model/Retinol_BEST.onnx"
 
 IMAGE_SIZE = 384
 NUM_CLASSES = 5
@@ -29,86 +22,199 @@ CLASS_NAMES = [
     "Grade 1",
     "Grade 2",
     "Grade 3",
-    "Grade 4"
+    "Grade 4",
 ]
 
 
 # ============================================================
-# NORMALIZATION
+# MODEL STATE
 # ============================================================
 
-IMAGENET_MEAN = np.array(
-    [0.485, 0.456, 0.406],
-    dtype=np.float32
-).reshape(3, 1, 1)
+session = None
+INPUT_NAME = None
+OUTPUT_NAME = None
 
-IMAGENET_STD = np.array(
-    [0.229, 0.224, 0.225],
-    dtype=np.float32
-).reshape(3, 1, 1)
+_model_state = "loading"
+_model_error = None
+
+_model_lock = threading.Lock()
+_model_thread = None
 
 
-def normalize_input(x):
+# ============================================================
+# MODEL LOADING
+# ============================================================
+
+def load_model():
+    global session
+    global INPUT_NAME
+    global OUTPUT_NAME
+
+    print("[MODEL] Loading ONNX model...", flush=True)
+
+    providers = [
+        "CPUExecutionProvider"
+    ]
+
+    sess = ort.InferenceSession(
+        MODEL_PATH,
+        providers=providers
+    )
+
+    input_name = sess.get_inputs()[0].name
+    output_name = sess.get_outputs()[0].name
+
+    print(
+        f"[MODEL] Input: {input_name}",
+        flush=True
+    )
+
+    print(
+        f"[MODEL] Output: {output_name}",
+        flush=True
+    )
+
+    print(
+        f"[MODEL] Providers: {sess.get_providers()}",
+        flush=True
+    )
+
+    return sess, input_name, output_name
+
+
+def _load_model_background():
+    global session
+    global INPUT_NAME
+    global OUTPUT_NAME
+    global _model_state
+    global _model_error
+
+    try:
+        sess, input_name, output_name = load_model()
+
+        session = sess
+        INPUT_NAME = input_name
+        OUTPUT_NAME = output_name
+
+        # ----------------------------------------------------
+        # Warmup
+        # ----------------------------------------------------
+
+        print("[MODEL] Running warmup...", flush=True)
+
+        dummy = np.zeros(
+            (
+                1,
+                4,
+                IMAGE_SIZE,
+                IMAGE_SIZE
+            ),
+            dtype=np.float32
+        )
+
+        session.run(
+            [OUTPUT_NAME],
+            {
+                INPUT_NAME: dummy
+            }
+        )
+
+        print(
+            "[MODEL] Warmup complete.",
+            flush=True
+        )
+
+        _model_state = "ready"
+
+        print(
+            "[MODEL] Model ready.",
+            flush=True
+        )
+
+    except Exception as e:
+        _model_error = str(e)
+        _model_state = "failed"
+
+        print(
+            f"[MODEL] Loading failed: {_model_error}",
+            flush=True
+        )
+
+
+def start_loading():
+    global _model_thread
+
+    with _model_lock:
+
+        if _model_state == "ready":
+            return
+
+        if (
+            _model_thread is not None
+            and _model_thread.is_alive()
+        ):
+            return
+
+        _model_thread = threading.Thread(
+            target=_load_model_background,
+            daemon=True
+        )
+
+        _model_thread.start()
+
+
+def get_state():
+    return _model_state, _model_error
+
+
+# Start loading when this module is imported.
+start_loading()
+
+
+# ============================================================
+# IMAGE HELPERS
+# ============================================================
+
+def pil_to_bgr(image):
     """
-    Same normalization used by the original PyTorch model.
-
-    RGB:
-        ImageNet mean/std
-
-    Edge:
-        (edge - 0.5) / 0.5
+    Convert PIL image into OpenCV BGR format.
     """
 
-    rgb = x[:3]
+    if image.mode != "RGB":
+        image = image.convert("RGB")
 
-    edge = x[3:4]
+    rgb = np.array(image)
 
-    rgb = (
-        rgb - IMAGENET_MEAN
-    ) / IMAGENET_STD
+    bgr = cv2.cvtColor(
+        rgb,
+        cv2.COLOR_RGB2BGR
+    )
 
-    edge = (
-        edge - 0.5
-    ) / 0.5
-
-    return np.concatenate(
-        [rgb, edge],
-        axis=0
-    ).astype(np.float32)
+    return bgr
 
 
 # ============================================================
 # RETINAL ROI
 # ============================================================
 
-def detect_retinal_roi(img):
+def find_retinal_roi(image):
     """
-    Detect retinal region using Otsu thresholding
-    and morphological operations.
+    Detect the approximate retinal region.
+
+    Uses grayscale thresholding + morphology to
+    remove most of the black background around the fundus.
     """
-
-    if img is None:
-        raise ValueError(
-            "Image is None."
-        )
-
-    h, w = img.shape[:2]
 
     gray = cv2.cvtColor(
-        img,
+        image,
         cv2.COLOR_BGR2GRAY
     )
 
-    _, thresh = cv2.threshold(
+    _, threshold = cv2.threshold(
         gray,
         0,
         255,
-        cv2.THRESH_BINARY
-        + cv2.THRESH_OTSU
-    )
-
-    thresh = cv2.bitwise_not(
-        thresh
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )
 
     kernel = cv2.getStructuringElement(
@@ -116,133 +222,74 @@ def detect_retinal_roi(img):
         (41, 41)
     )
 
-    thresh = cv2.morphologyEx(
-        thresh,
+    threshold = cv2.morphologyEx(
+        threshold,
         cv2.MORPH_CLOSE,
         kernel
     )
 
-    thresh = cv2.morphologyEx(
-        thresh,
+    threshold = cv2.morphologyEx(
+        threshold,
         cv2.MORPH_OPEN,
         kernel
     )
 
     contours, _ = cv2.findContours(
-        thresh,
+        threshold,
         cv2.RETR_EXTERNAL,
         cv2.CHAIN_APPROX_SIMPLE
     )
 
     if not contours:
-        return img
+        return image
 
-    contour = max(
+    largest_contour = max(
         contours,
         key=cv2.contourArea
     )
 
-    area = cv2.contourArea(
-        contour
+    x, y, w, h = cv2.boundingRect(
+        largest_contour
     )
 
-    if area < (0.10 * h * w):
-        return img
+    if w <= 0 or h <= 0:
+        return image
 
-    x, y, cw, ch = cv2.boundingRect(
-        contour
-    )
-
-    margin = int(
-        0.08 * max(cw, ch)
-    )
-
-    x1 = max(
-        0,
-        x - margin
-    )
-
-    y1 = max(
-        0,
-        y - margin
-    )
-
-    x2 = min(
-        w,
-        x + cw + margin
-    )
-
-    y2 = min(
-        h,
-        y + ch + margin
-    )
-
-    crop = img[
-        y1:y2,
-        x1:x2
+    return image[
+        y:y + h,
+        x:x + w
     ]
 
-    return (
-        crop
-        if crop.size > 0
-        else img
-    )
-
 
 # ============================================================
-# SQUARE CROP
+# CENTERED SQUARE CROP
 # ============================================================
 
-def square_crop(img):
+def center_square_crop(image):
     """
-    Extract a centered square region.
+    Crop the image into a centered square.
     """
 
-    h, w = img.shape[:2]
+    height, width = image.shape[:2]
 
     size = min(
-        h,
-        w
+        height,
+        width
     )
 
-    cx = w // 2
-    cy = h // 2
-
-    half = size // 2
-
-    x1 = max(
+    start_x = max(
         0,
-        cx - half
+        (width - size) // 2
     )
 
-    y1 = max(
+    start_y = max(
         0,
-        cy - half
+        (height - size) // 2
     )
 
-    x2 = min(
-        w,
-        x1 + size
-    )
-
-    y2 = min(
-        h,
-        y1 + size
-    )
-
-    crop = img[
-        y1:y2,
-        x1:x2
-    ]
-
-    side = min(
-        crop.shape[0],
-        crop.shape[1]
-    )
-
-    return crop[
-        :side,
-        :side
+    return image[
+        start_y:start_y + size,
+        start_x:start_x + size
     ]
 
 
@@ -250,17 +297,17 @@ def square_crop(img):
 # CLAHE
 # ============================================================
 
-def apply_clahe(img):
+def apply_clahe(image):
     """
-    Same CLAHE preprocessing used during training.
+    Apply CLAHE independently to LAB lightness channel.
     """
 
     lab = cv2.cvtColor(
-        img,
+        image,
         cv2.COLOR_BGR2LAB
     )
 
-    l, a, b = cv2.split(
+    l_channel, a_channel, b_channel = cv2.split(
         lab
     )
 
@@ -269,16 +316,20 @@ def apply_clahe(img):
         tileGridSize=(8, 8)
     )
 
-    l = clahe.apply(
-        l
+    l_channel = clahe.apply(
+        l_channel
     )
 
-    enhanced = cv2.merge(
-        [l, a, b]
+    lab = cv2.merge(
+        (
+            l_channel,
+            a_channel,
+            b_channel
+        )
     )
 
     return cv2.cvtColor(
-        enhanced,
+        lab,
         cv2.COLOR_LAB2BGR
     )
 
@@ -287,66 +338,60 @@ def apply_clahe(img):
 # ILLUMINATION NORMALIZATION
 # ============================================================
 
-def normalize_illumination(img):
+def normalize_illumination(image):
     """
-    Background illumination normalization.
+    Remove slow illumination variation using
+    a large Gaussian background estimate.
     """
-
-    lab = cv2.cvtColor(
-        img,
-        cv2.COLOR_BGR2LAB
-    )
-
-    l, a, b = cv2.split(
-        lab
-    )
 
     background = cv2.GaussianBlur(
-        l,
+        image,
         (0, 0),
         sigmaX=40
     )
 
-    corrected = (
-        l.astype(np.float32)
-        - background.astype(np.float32)
-        + 128.0
+    image_float = image.astype(
+        np.float32
     )
 
-    corrected = np.clip(
-        corrected,
+    background_float = background.astype(
+        np.float32
+    )
+
+    normalized = (
+        image_float
+        / (background_float + 1.0)
+    )
+
+    normalized = normalized * 128.0
+
+    normalized = np.clip(
+        normalized,
         0,
         255
     ).astype(np.uint8)
 
-    output = cv2.merge(
-        [corrected, a, b]
-    )
-
-    return cv2.cvtColor(
-        output,
-        cv2.COLOR_LAB2BGR
-    )
+    return normalized
 
 
 # ============================================================
 # EDGE EXTRACTION
 # ============================================================
 
-def extract_edges(img):
+def extract_edges(image):
     """
-    Canny edge extraction used by the trained model.
+    Generate Canny edge channel.
     """
 
     gray = cv2.cvtColor(
-        img,
+        image,
         cv2.COLOR_BGR2GRAY
     )
 
     gray = cv2.GaussianBlur(
         gray,
         (7, 7),
-        1.0
+        0
     )
 
     edges = cv2.Canny(
@@ -357,7 +402,7 @@ def extract_edges(img):
 
     kernel = np.ones(
         (3, 3),
-        np.uint8
+        dtype=np.uint8
     )
 
     edges = cv2.dilate(
@@ -376,323 +421,33 @@ def extract_edges(img):
 
 
 # ============================================================
-# MODEL STATE
-# ============================================================
-
-_session = None
-_input_name = None
-_output_name = None
-
-_state = "loading"
-_error = None
-
-_lock = threading.Lock()
-
-# Prevent multiple background loading threads
-_loading_started = False
-
-
-def _load_model_sync():
-    global _session
-    global _input_name
-    global _output_name
-    global _state
-    global _error
-
-    try:
-
-        print(
-            "========== MODEL LOADING START ==========",
-            flush=True
-        )
-
-        print(
-            f"Loading ONNX model from: {MODEL_PATH}",
-            flush=True
-        )
-
-        print(
-            "Creating ONNX Runtime session...",
-            flush=True
-        )
-
-        session = ort.InferenceSession(
-            str(MODEL_PATH),
-            providers=[
-                "CPUExecutionProvider"
-            ]
-        )
-
-        print(
-            "ONNX Runtime session CREATED.",
-            flush=True
-        )
-
-        input_name = (
-            session
-            .get_inputs()[0]
-            .name
-        )
-
-        output_name = (
-            session
-            .get_outputs()[0]
-            .name
-        )
-
-        print(
-            "Starting warmup inference...",
-            flush=True
-        )
-
-        dummy_input = np.zeros(
-            (
-                1,
-                4,
-                IMAGE_SIZE,
-                IMAGE_SIZE
-            ),
-            dtype=np.float32
-        )
-
-        session.run(
-            [output_name],
-            {
-                input_name: dummy_input
-            }
-        )
-
-        print(
-            "WARMUP COMPLETE.",
-            flush=True
-        )
-
-        with _lock:
-
-            _session = session
-            _input_name = input_name
-            _output_name = output_name
-
-            _state = "ready"
-
-        print(
-            "========== MODEL READY ==========",
-            flush=True
-        )
-
-        print(
-            f"Input: {input_name}",
-            flush=True
-        )
-
-        print(
-            f"Output: {output_name}",
-            flush=True
-        )
-
-        print(
-            f"Provider: {session.get_providers()}",
-            flush=True
-        )
-
-    except Exception as e:
-
-        with _lock:
-
-            _state = "failed"
-            _error = str(e)
-
-        print(
-            f"MODEL LOAD FAILED: {e}",
-            flush=True
-        )
-
-
-def start_loading():
-    """
-    Start model loading exactly once.
-
-    Loading runs on a daemon thread so Flask/Gunicorn
-    can continue serving requests while the model loads.
-    """
-
-    global _loading_started
-
-    with _lock:
-
-        if _loading_started:
-            return
-
-        _loading_started = True
-
-    print(
-        "Starting background model loader...",
-        flush=True
-    )
-
-    thread = threading.Thread(
-        target=_load_model_sync,
-        daemon=True
-    )
-
-    thread.start()
-
-
-def get_state():
-    """
-    Returns (state, error) where state is one of:
-        "loading"
-        "ready"
-        "failed"
-    """
-
-    with _lock:
-
-        return (
-            _state,
-            _error
-        )
-
-
-def get_session():
-    """
-    Returns:
-        session
-        input_name
-        output_name
-    """
-
-    with _lock:
-
-        return (
-            _session,
-            _input_name,
-            _output_name
-        )
-
-
-# ============================================================
-# IMAGE PREPROCESSING
+# PREPROCESSING
 # ============================================================
 
 def preprocess_image(image):
+    """
+    Complete preprocessing pipeline.
 
-    # --------------------------------------------------------
-    # Convert to NumPy RGB
-    # --------------------------------------------------------
+    Output:
+        tensor       -> (1, 4, 384, 384)
+        roi_image    -> processed retinal image
+        edges        -> edge image
+    """
 
-    if isinstance(
-        image,
-        Image.Image
-    ):
-
-        image = image.convert(
-            "RGB"
-        )
-
-        image = np.asarray(
-            image
-        )
-
-    else:
-
-        image = np.asarray(
-            image
-        )
-
-    # --------------------------------------------------------
-    # Grayscale
-    # --------------------------------------------------------
-
-    if image.ndim == 2:
-
-        image = cv2.cvtColor(
-            image,
-            cv2.COLOR_GRAY2RGB
-        )
-
-    # --------------------------------------------------------
-    # RGBA
-    # --------------------------------------------------------
-
-    if (
-        image.ndim == 3
-        and image.shape[2] == 4
-    ):
-
-        image = image[:, :, :3]
-
-    # --------------------------------------------------------
-    # Validate
-    # --------------------------------------------------------
-
-    if (
-        image.ndim != 3
-        or image.shape[2] != 3
-    ):
-
-        raise ValueError(
-            f"Invalid image shape: {image.shape}"
-        )
-
-    # --------------------------------------------------------
-    # Convert to uint8
-    # --------------------------------------------------------
-
-    if image.dtype != np.uint8:
-
-        if np.issubdtype(
-            image.dtype,
-            np.floating
-        ):
-
-            if image.max() <= 1.0:
-
-                image = image * 255.0
-
-        image = np.clip(
-            image,
-            0,
-            255
-        ).astype(
-            np.uint8
-        )
-
-    image = np.ascontiguousarray(
+    image = pil_to_bgr(
         image
     )
 
-    # --------------------------------------------------------
-    # RGB -> BGR
-    # --------------------------------------------------------
-
-    bgr = cv2.cvtColor(
-        image,
-        cv2.COLOR_RGB2BGR
+    roi_image = find_retinal_roi(
+        image
     )
 
-    # --------------------------------------------------------
-    # ROI
-    # --------------------------------------------------------
-
-    roi = detect_retinal_roi(
-        bgr
+    roi_image = center_square_crop(
+        roi_image
     )
 
-    # --------------------------------------------------------
-    # Square crop
-    # --------------------------------------------------------
-
-    roi = square_crop(
-        roi
-    )
-
-    # --------------------------------------------------------
-    # Resize
-    # --------------------------------------------------------
-
-    roi = cv2.resize(
-        roi,
+    roi_image = cv2.resize(
+        roi_image,
         (
             IMAGE_SIZE,
             IMAGE_SIZE
@@ -700,171 +455,133 @@ def preprocess_image(image):
         interpolation=cv2.INTER_AREA
     )
 
-    # --------------------------------------------------------
-    # CLAHE
-    # --------------------------------------------------------
+    roi_image = apply_clahe(
+        roi_image
+    )
 
-    roi = apply_clahe(
-        roi
+    roi_image = normalize_illumination(
+        roi_image
+    )
+
+    edges = extract_edges(
+        roi_image
     )
 
     # --------------------------------------------------------
-    # Illumination normalization
+    # Convert BGR -> RGB
     # --------------------------------------------------------
 
-    roi = normalize_illumination(
-        roi
-    )
-
-    # --------------------------------------------------------
-    # RGB
-    # --------------------------------------------------------
-
-    processed_rgb = cv2.cvtColor(
-        roi,
+    rgb = cv2.cvtColor(
+        roi_image,
         cv2.COLOR_BGR2RGB
     )
 
-    processed_rgb = (
-        np.ascontiguousarray(
-            processed_rgb
-        ).astype(
-            np.uint8
-        )
-    )
+    rgb = rgb.astype(
+        np.float32
+    ) / 255.0
 
-    # --------------------------------------------------------
-    # Edges
-    # --------------------------------------------------------
-
-    edges = extract_edges(
-        roi
-    )
-
-    edges = (
-        np.ascontiguousarray(
-            edges
-        ).astype(
-            np.uint8
-        )
-    )
-
-    # --------------------------------------------------------
-    # Convert to 0-1
-    # --------------------------------------------------------
-
-    rgb_float = (
-        processed_rgb.astype(
-            np.float32
-        ) / 255.0
-    )
-
-    edge_float = (
-        edges.astype(
-            np.float32
-        ) / 255.0
-    )
-
-    # --------------------------------------------------------
-    # RGB + EDGE
-    # --------------------------------------------------------
-
-    combined = np.concatenate(
+    # ImageNet normalization
+    mean = np.array(
         [
-            rgb_float,
-            edge_float[..., None]
+            0.485,
+            0.456,
+            0.406
         ],
-        axis=2
+        dtype=np.float32
     )
+
+    std = np.array(
+        [
+            0.229,
+            0.224,
+            0.225
+        ],
+        dtype=np.float32
+    )
+
+    rgb = (
+        rgb - mean
+    ) / std
+
+    # --------------------------------------------------------
+    # Edge normalization
+    # --------------------------------------------------------
+
+    edge = edges.astype(
+        np.float32
+    ) / 255.0
+
+    edge = (
+        edge - 0.5
+    ) / 0.5
+
+    edge = edge[
+        np.newaxis,
+        ...,
+        np.newaxis
+    ]
 
     # --------------------------------------------------------
     # HWC -> CHW
     # --------------------------------------------------------
 
-    combined = np.transpose(
-        combined,
+    rgb = np.transpose(
+        rgb,
         (2, 0, 1)
     )
 
-    combined = (
-        np.ascontiguousarray(
-            combined
-        ).astype(
-            np.float32
-        )
+    edge = np.transpose(
+        edge,
+        (3, 0, 1, 2)
     )
 
-    # --------------------------------------------------------
-    # Normalize
-    # --------------------------------------------------------
-
-    combined = normalize_input(
-        combined
-    )
+    edge = edge[0]
 
     # --------------------------------------------------------
-    # Add batch dimension
+    # RGB + Edge = 4 channels
     # --------------------------------------------------------
 
-    tensor = np.expand_dims(
-        combined,
+    tensor = np.concatenate(
+        [
+            rgb,
+            edge
+        ],
         axis=0
-    ).astype(
+    )
+
+    tensor = tensor[
+        np.newaxis,
+        ...
+    ].astype(
         np.float32
     )
 
-    # --------------------------------------------------------
-    # Display exactly the processed RGB image
-    # --------------------------------------------------------
-
-    display_roi = processed_rgb
-
     return (
         tensor,
-        display_roi,
+        roi_image,
         edges
     )
 
 
 # ============================================================
-# IMAGE -> BASE64
+# MODEL INFERENCE
 # ============================================================
 
-def image_to_base64(image):
+def run_model(tensor):
 
-    # Processed image is RGB.
-    # OpenCV expects BGR for color encoding.
-
-    if (
-        image.ndim == 3
-        and image.shape[2] == 3
-    ):
-
-        image_bgr = cv2.cvtColor(
-            image,
-            cv2.COLOR_RGB2BGR
+    if session is None:
+        raise RuntimeError(
+            "Model is not loaded yet."
         )
 
-    else:
-
-        image_bgr = image
-
-    success, buffer = cv2.imencode(
-        ".png",
-        image_bgr
+    outputs = session.run(
+        [OUTPUT_NAME],
+        {
+            INPUT_NAME: tensor
+        }
     )
 
-    if not success:
-
-        raise ValueError(
-            "Failed to encode image."
-        )
-
-    return base64.b64encode(
-        buffer.tobytes()
-    ).decode(
-        "utf-8"
-    )
+    return outputs[0]
 
 
 # ============================================================
@@ -872,6 +589,10 @@ def image_to_base64(image):
 # ============================================================
 
 def softmax(logits):
+
+    logits = logits.astype(
+        np.float32
+    )
 
     logits = (
         logits
@@ -882,14 +603,14 @@ def softmax(logits):
         )
     )
 
-    exp_logits = np.exp(
+    exp_values = np.exp(
         logits
     )
 
     return (
-        exp_logits
+        exp_values
         / np.sum(
-            exp_logits,
+            exp_values,
             axis=1,
             keepdims=True
         )
@@ -897,31 +618,35 @@ def softmax(logits):
 
 
 # ============================================================
-# ONNX INFERENCE
+# IMAGE -> BASE64
 # ============================================================
 
-def run_model(tensor):
-    """
-    Run one forward pass through ONNX Runtime.
-    """
+def image_to_base64(image):
 
-    session, input_name, output_name = (
-        get_session()
-    )
+    if len(image.shape) == 2:
 
-    if session is None:
-        raise RuntimeError(
-            "ONNX model session is not ready."
+        success, encoded = cv2.imencode(
+            ".jpg",
+            image
         )
 
-    logits = session.run(
-        [output_name],
-        {
-            input_name: tensor
-        }
-    )[0]
+    else:
 
-    return logits
+        success, encoded = cv2.imencode(
+            ".jpg",
+            image
+        )
+
+    if not success:
+        raise RuntimeError(
+            "Failed to encode image."
+        )
+
+    return base64.b64encode(
+        encoded.tobytes()
+    ).decode(
+        "utf-8"
+    )
 
 
 # ============================================================
@@ -933,13 +658,13 @@ def predict(image):
     total_start = time.perf_counter()
 
     # --------------------------------------------------------
-    # Preprocessing
+    # PREPROCESSING
     # --------------------------------------------------------
 
     preprocessing_start = time.perf_counter()
 
-    tensor, roi_image, edges = (
-        preprocess_image(image)
+    tensor, roi_image, edges = preprocess_image(
+        image
     )
 
     print(
@@ -949,131 +674,41 @@ def predict(image):
     )
 
     # --------------------------------------------------------
-    # Original
+    # SINGLE MODEL INFERENCE
+    #
+    # IMPORTANT:
+    # This is intentionally only ONE forward pass.
+    #
+    # Previous version:
+    #   original       40%
+    #   horizontal     25%
+    #   vertical       20%
+    #   rotation       15%
+    #
+    # This benchmark:
+    #   original       100%
     # --------------------------------------------------------
 
     inference_start = time.perf_counter()
 
-    logits1 = run_model(
+    logits = run_model(
         tensor
     )
 
     print(
-        f"[TIMING] inference 1 (original): "
+        f"[TIMING] inference (single pass): "
         f"{time.perf_counter() - inference_start:.3f}s",
         flush=True
     )
 
-    probs1 = softmax(
-        logits1
+    probs = softmax(
+        logits
     )
-
-    # --------------------------------------------------------
-    # Horizontal flip
-    # --------------------------------------------------------
-
-    tensor_h = np.flip(
-        tensor,
-        axis=3
-    ).copy()
-
-    inference_start = time.perf_counter()
-
-    logits2 = run_model(
-        tensor_h
-    )
-
-    print(
-        f"[TIMING] inference 2 (horizontal flip): "
-        f"{time.perf_counter() - inference_start:.3f}s",
-        flush=True
-    )
-
-    probs2 = softmax(
-        logits2
-    )
-
-    # --------------------------------------------------------
-    # Vertical flip
-    # --------------------------------------------------------
-
-    tensor_v = np.flip(
-        tensor,
-        axis=2
-    ).copy()
-
-    inference_start = time.perf_counter()
-
-    logits3 = run_model(
-        tensor_v
-    )
-
-    print(
-        f"[TIMING] inference 3 (vertical flip): "
-        f"{time.perf_counter() - inference_start:.3f}s",
-        flush=True
-    )
-
-    probs3 = softmax(
-        logits3
-    )
-
-    # --------------------------------------------------------
-    # Rotation
-    # --------------------------------------------------------
-
-    tensor_r = np.rot90(
-        tensor,
-        k=1,
-        axes=(2, 3)
-    ).copy()
-
-    inference_start = time.perf_counter()
-
-    logits4 = run_model(
-        tensor_r
-    )
-
-    print(
-        f"[TIMING] inference 4 (rotation): "
-        f"{time.perf_counter() - inference_start:.3f}s",
-        flush=True
-    )
-
-    probs4 = softmax(
-        logits4
-    )
-
-    # --------------------------------------------------------
-    # Weighted TTA
-    #
-    # Original:       0.40
-    # Horizontal:     0.25
-    # Vertical:       0.20
-    # Rotation:       0.15
-    # --------------------------------------------------------
-
-    probs = (
-        0.40 * probs1
-        + 0.25 * probs2
-        + 0.20 * probs3
-        + 0.15 * probs4
-    )
-
-    # --------------------------------------------------------
-    # Remove batch dimension
-    # --------------------------------------------------------
 
     probs = probs[0]
 
-    # --------------------------------------------------------
-    # Prediction
-    # --------------------------------------------------------
-
     predicted_index = int(
-        np.argmax(
-            probs
-        )
+        np.argmax(probs)
     )
 
     confidence = float(
@@ -1088,7 +723,7 @@ def predict(image):
     }
 
     # --------------------------------------------------------
-    # Base64 encoding
+    # BASE64 OUTPUTS
     # --------------------------------------------------------
 
     base64_start = time.perf_counter()
@@ -1108,7 +743,7 @@ def predict(image):
     )
 
     # --------------------------------------------------------
-    # Total predict()
+    # TOTAL
     # --------------------------------------------------------
 
     print(
@@ -1118,74 +753,14 @@ def predict(image):
     )
 
     # --------------------------------------------------------
-    # Return API structure
+    # RESPONSE
     # --------------------------------------------------------
 
     return {
-        "prediction": CLASS_NAMES[
-            predicted_index
-        ],
-
+        "prediction": CLASS_NAMES[predicted_index],
         "grade": predicted_index,
-
         "confidence": confidence,
-
         "probabilities": probabilities,
-
         "processed_image": processed_image_base64,
-
         "edge_image": edge_image_base64
     }
-
-
-# ============================================================
-# TEST
-# ============================================================
-
-if __name__ == "__main__":
-
-    print()
-    print("=" * 60)
-    print("ONNX INFERENCE MODULE — MANUAL TEST")
-    print("=" * 60)
-
-    start_loading()
-
-    while True:
-
-        state, error = get_state()
-
-        if state == "ready":
-            break
-
-        if state == "failed":
-
-            print(
-                f"Load failed: {error}"
-            )
-
-            raise SystemExit(1)
-
-        time.sleep(0.5)
-
-    session, input_name, output_name = (
-        get_session()
-    )
-
-    print(
-        f"Model: {MODEL_PATH}"
-    )
-
-    print(
-        f"Input: 4 x {IMAGE_SIZE} x {IMAGE_SIZE}"
-    )
-
-    print(
-        f"Classes: {CLASS_NAMES}"
-    )
-
-    print(
-        f"Provider: {session.get_providers()}"
-    )
-
-    print("=" * 60)
